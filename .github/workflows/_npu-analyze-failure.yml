@@ -104,6 +104,7 @@ jobs:
             --recommendations-file "${RECS_FILE}" \
             --recommendations-source "${RECS_SOURCE:-none}" \
             --output ./test-logs/failure_report.md
+          cat ./test-logs/failure_report.md >> "$GITHUB_STEP_SUMMARY"
 
       # ----- Step 4: Upload report -----
       - name: Upload failure analysis report
