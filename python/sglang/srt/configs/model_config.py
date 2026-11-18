@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.beam_search.trie_config import TRIE_OUTPUT_HEAD_FILENAME
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.ernie55 import (
@@ -50,7 +51,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -256,12 +257,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -1799,9 +1803,6 @@ class ModelConfig:
         if rope_scaling:
             self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
-
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
         total_num_attention_heads = self.num_attention_heads or 0
@@ -2204,6 +2205,8 @@ class ModelConfig:
             "quark_mxfp4",
             "minimax_m3_nvfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
@@ -2438,7 +2441,9 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=["*config.json", f"*{TRIE_OUTPUT_HEAD_FILENAME}"]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
@@ -2606,6 +2611,9 @@ multimodal_model_archs = [
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",
@@ -2885,6 +2893,20 @@ def is_layer_types_hybrid_swa_model(
     )
 
 
+# LFM3 family: every variant resolves a text config whose `layer_types` interleaves
+# `conv` layers with full and sliding attention, so mixed_sliding_layer_types()
+# (which requires every entry to be sliding or full) never matches it and the
+# archs have to be listed.
+LFM3_HYBRID_SWA_ARCHS = frozenset(
+    {
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3OmniForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
+    }
+)
+
+
 def _is_listed_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
@@ -2913,6 +2935,7 @@ def _is_listed_hybrid_swa_model(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
+        *LFM3_HYBRID_SWA_ARCHS,
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         if "BeamForCausalLM" in model_architectures and hf_text_config is not None:
@@ -2939,7 +2962,43 @@ def get_hybrid_layer_ids(
     hf_text_config: PretrainedConfig,
 ):
     num_hidden_layers = hf_text_config.num_hidden_layers
-    if "Llama4ForConditionalGeneration" in model_architectures:
+    if any(arch in LFM3_HYBRID_SWA_ARCHS for arch in model_architectures):
+        # LFM3's conv layers hold their state in the Mamba pool and read no KV
+        # cache, so they belong to neither side of the split. Only the attention
+        # layers that RadixAttention builds with a sliding window go to the
+        # window pool; ModelRunner re-checks this split against the built model.
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        if not layer_types:
+            raise ValueError(
+                "LFM3 hybrid SWA model requires `layer_types` in its text config, "
+                f"but got {layer_types!r} for architectures {model_architectures}."
+            )
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                "LFM3 `layer_types` length does not match num_hidden_layers: "
+                f"{len(layer_types)} != {num_hidden_layers}."
+            )
+        unknown = sorted(
+            {
+                kind
+                for kind in layer_types
+                if kind not in ("conv", "full_attention", "sliding_attention")
+            }
+        )
+        if unknown:
+            raise ValueError(f"LFM3 has unsupported layer types: {unknown}.")
+        swa_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "full_attention"
+        ]
+        if not swa_attention_layer_ids:
+            raise ValueError(
+                "LFM3 hybrid SWA model must contain at least one sliding_attention "
+                f"layer, but layer_types={layer_types!r}."
+            )
+    elif "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
         ]
